@@ -5,16 +5,18 @@ import (
     "leaderboard/internal/cache"
     "leaderboard/internal/models"
     "leaderboard/internal/repository"
+    "log"
     "sync"
     "time"
 )
 
 type LeaderboardService struct {
-    repo         *repository.PostgresRepository
-    cache        *cache.RedisCache
-    mutex        sync.RWMutex
+    repo          *repository.PostgresRepository
+    cache         *cache.RedisCache
+    mutex         sync.RWMutex
     neighborCount int
-    cacheTTL     time.Duration
+    cacheTTL      time.Duration
+    refreshTTL    time.Duration 
 }
 
 func NewLeaderboardService(
@@ -22,12 +24,18 @@ func NewLeaderboardService(
     cache *cache.RedisCache,
     neighborCount int,
 ) *LeaderboardService {
-    return &LeaderboardService{
+    svc := &LeaderboardService{
         repo:          repo,
         cache:         cache,
         neighborCount: neighborCount,
-        cacheTTL:      30 * time.Second,
+        cacheTTL:      2 * time.Minute, 
+        refreshTTL:    30 * time.Second, 
     }
+    
+    // Запускаем фоновое обновление кэша
+    go svc.backgroundRefresh()
+    
+    return svc
 }
 
 func (s *LeaderboardService) UpdateScore(playerID string, delta int64) error {
@@ -36,15 +44,19 @@ func (s *LeaderboardService) UpdateScore(playerID string, delta int64) error {
         return err
     }
 
-    // Инвалидируем кэш
+    // Атомарная инвалидация кэша с обработкой ошибок
     s.mutex.Lock()
     defer s.mutex.Unlock()
 
-    // Инвалидируем топ-лист
-    s.cache.InvalidateTop()
-
-    // Инвалидируем данные игрока
-    s.cache.InvalidatePlayer(playerID)
+    // Инвалидируем кэш
+    if err := s.cache.InvalidateTop(); err != nil {
+        // Логируем, но не возвращаем ошибку клиенту
+        log.Printf("Warning: failed to invalidate top cache: %v", err)
+    }
+    
+    if err := s.cache.InvalidatePlayer(playerID); err != nil {
+        log.Printf("Warning: failed to invalidate player cache: %v", err)
+    }
 
     return nil
 }
@@ -56,6 +68,10 @@ func (s *LeaderboardService) GetTopPlayers(limit int) ([]models.LeaderboardEntry
     // Пытаемся получить из кэша
     entries, err := s.cache.GetTopPlayers()
     if err == nil && entries != nil {
+        // Проверяем, не пора ли обновить кэш
+        if s.shouldRefreshTopCache() {
+            go s.refreshTopCache(limit) // Фоновое обновление
+        }
         return entries, nil
     }
 
@@ -65,10 +81,52 @@ func (s *LeaderboardService) GetTopPlayers(limit int) ([]models.LeaderboardEntry
         return nil, err
     }
 
-    // Сохраняем в кэш
-    s.cache.SetTopPlayers(entries, s.cacheTTL)
+    // Сохраняем в кэш с обработкой ошибки
+    if err := s.cache.SetTopPlayers(entries, s.cacheTTL); err != nil {
+        log.Printf("Failed to set top cache: %v", err)
+    }
 
     return entries, nil
+}
+
+// Фоновое обновление кэша
+func (s *LeaderboardService) backgroundRefresh() {
+    ticker := time.NewTicker(s.refreshTTL)
+    defer ticker.Stop()
+    
+    for range ticker.C {
+        s.mutex.Lock()
+        if s.shouldRefreshTopCache() {
+            s.refreshTopCache(100)
+        }
+        s.mutex.Unlock()
+    }
+}
+
+func (s *LeaderboardService) shouldRefreshTopCache() bool {
+    if !s.cache.TopPlayersExists() {
+        return true
+    }
+    
+    ttl, err := s.cache.GetTopPlayersTTL()
+    if err != nil {
+        return true
+    }
+    
+    // Обновляем, если осталось меньше 30 секунд
+    return ttl < s.refreshTTL
+}
+
+func (s *LeaderboardService) refreshTopCache(limit int) {
+    entries, err := s.repo.GetTopPlayers(limit)
+    if err != nil {
+        log.Printf("Failed to refresh top cache: %v", err)
+        return
+    }
+    
+    if err := s.cache.SetTopPlayers(entries, s.cacheTTL); err != nil {
+        log.Printf("Failed to set refreshed top cache: %v", err)
+    }
 }
 
 func (s *LeaderboardService) GetPlayerRank(playerID string) (*models.RankResponse, error) {
@@ -100,9 +158,14 @@ func (s *LeaderboardService) GetPlayerRank(playerID string) (*models.RankRespons
         return nil, err
     }
 
-    // Сохраняем в кэш
-    s.cache.SetPlayerRank(playerID, rank, score, s.cacheTTL)
-    s.cache.SetPlayersAround(playerID, around, s.cacheTTL)
+    // Сохраняем в кэш с обработкой ошибок
+    if err := s.cache.SetPlayerRank(playerID, rank, score, s.cacheTTL); err != nil {
+        log.Printf("Failed to cache player rank: %v", err)
+    }
+    
+    if err := s.cache.SetPlayersAround(playerID, around, s.cacheTTL); err != nil {
+        log.Printf("Failed to cache players around: %v", err)
+    }
 
     return s.buildRankResponse(playerID, rank, score, around), nil
 }

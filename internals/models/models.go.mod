@@ -9,8 +9,8 @@ type PlayerScore struct {
 }
 
 type ScoreUpdateRequest struct {
-    PlayerID   string `json:"player_id" binding:"required"`
-    ScoreDelta int64  `json:"score_delta" binding:"required"`
+    PlayerID   string `json:"player_id" binding:"required,min=1,max=255"` // Валидация
+    ScoreDelta int64  `json:"score_delta" binding:"required,min=1,max=1000000"` // Ограничение
 }
 
 type LeaderboardEntry struct {

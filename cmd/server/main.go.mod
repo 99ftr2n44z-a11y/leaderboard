@@ -14,6 +14,8 @@ import (
     "leaderboard/internal/config"
     "leaderboard/internal/repository"
     "leaderboard/internal/service"
+
+    "github.com/gin-gonic/gin"
 )
 
 func main() {
@@ -21,6 +23,11 @@ func main() {
     cfg, err := config.Load()
     if err != nil {
         log.Fatalf("Failed to load config: %v", err)
+    }
+
+    // Установка режима
+    if os.Getenv("GIN_MODE") == "release" {
+        gin.SetMode(gin.ReleaseMode)
     }
 
     // Инициализируем репозиторий PostgreSQL
@@ -47,6 +54,11 @@ func main() {
     // Инициализируем HTTP хендлеры
     handler := api.NewHandler(svc)
     router := api.SetupRouter(handler)
+
+    // healthcheck endpoint
+    router.GET("/health", func(c *gin.Context) {
+        c.JSON(http.StatusOK, gin.H{"status": "healthy"})
+    })
 
     // Запускаем сервер
     srv := &http.Server{

@@ -4,7 +4,6 @@ import (
     "database/sql"
     "fmt"
     "leaderboard/internal/models"
-    "sync"
     "time"
 
     _ "github.com/lib/pq"
@@ -12,7 +11,7 @@ import (
 
 type PostgresRepository struct {
     db *sql.DB
-    mu sync.RWMutex
+    // потокобезопасно
 }
 
 func NewPostgresRepository(connString string) (*PostgresRepository, error) {
@@ -38,8 +37,12 @@ func (r *PostgresRepository) Close() error {
 }
 
 func (r *PostgresRepository) UpdateScore(playerID string, delta int64) error {
-    r.mu.Lock()
-    defer r.mu.Unlock()
+    // Используем транзакцию для атомарности
+    tx, err := r.db.Begin()
+    if err != nil {
+        return err
+    }
+    defer tx.Rollback()
 
     query := `
         INSERT INTO player_scores (player_id, score, last_update, season_id)
@@ -50,15 +53,22 @@ func (r *PostgresRepository) UpdateScore(playerID string, delta int64) error {
             last_update = NOW()
         WHERE player_scores.player_id = $1 
           AND player_scores.season_id = (SELECT current_season_id())
+        RETURNING score
     `
 
-    _, err := r.db.Exec(query, playerID, delta)
-    return err
+    var newScore int64
+    err = tx.QueryRow(query, playerID, delta).Scan(&newScore)
+    if err != nil {
+        return err
+    }
+
+    return tx.Commit()
 }
 
 func (r *PostgresRepository) GetTopPlayers(limit int) ([]models.LeaderboardEntry, error) {
+    // Оптимизированный запрос с использованием MATERIALIZED CTE
     query := `
-        WITH ranked AS (
+        WITH ranked AS MATERIALIZED (
             SELECT 
                 player_id,
                 score,
@@ -70,6 +80,7 @@ func (r *PostgresRepository) GetTopPlayers(limit int) ([]models.LeaderboardEntry
         FROM ranked
         WHERE rank <= $1
         ORDER BY rank
+        LIMIT $1
     `
 
     rows, err := r.db.Query(query, limit)
@@ -90,67 +101,30 @@ func (r *PostgresRepository) GetTopPlayers(limit int) ([]models.LeaderboardEntry
     return entries, nil
 }
 
-func (r *PostgresRepository) GetPlayerRank(playerID string) (int, int64, error) {
-    query := `
-        SELECT 
-            rank,
-            score
-        FROM (
-            SELECT 
-                player_id,
-                score,
-                ROW_NUMBER() OVER (ORDER BY score DESC, last_update ASC) as rank
-            FROM player_scores
-            WHERE season_id = (SELECT current_season_id())
-        ) ranked
-        WHERE player_id = $1
-    `
-
-    var rank int
-    var score int64
-    err := r.db.QueryRow(query, playerID).Scan(&rank, &score)
-    if err == sql.ErrNoRows {
-        return 0, 0, nil
-    }
-    if err != nil {
-        return 0, 0, err
-    }
-
-    return rank, score, nil
-}
-
+// Опитимизировал
 func (r *PostgresRepository) GetPlayersAround(playerID string, n int) ([]models.LeaderboardEntry, error) {
-    // Получаем ранг игрока
-    rank, _, err := r.GetPlayerRank(playerID)
-    if err != nil {
-        return nil, err
-    }
-    if rank == 0 {
-        return []models.LeaderboardEntry{}, nil
-    }
-
-    startRank := rank - n
-    if startRank < 1 {
-        startRank = 1
-    }
-    endRank := rank + n
-
     query := `
-        WITH ranked AS (
+        WITH ranked AS MATERIALIZED (
             SELECT 
                 player_id,
                 score,
                 ROW_NUMBER() OVER (ORDER BY score DESC, last_update ASC) as rank
             FROM player_scores
             WHERE season_id = (SELECT current_season_id())
+        ),
+        target_rank AS (
+            SELECT rank FROM ranked WHERE player_id = $1
         )
-        SELECT player_id, score, rank
-        FROM ranked
-        WHERE rank BETWEEN $1 AND $2
-        ORDER BY rank
+        SELECT 
+            r.player_id,
+            r.score,
+            r.rank
+        FROM ranked r, target_rank t
+        WHERE r.rank BETWEEN t.rank - $2 AND t.rank + $2
+        ORDER BY r.rank
     `
 
-    rows, err := r.db.Query(query, startRank, endRank)
+    rows, err := r.db.Query(query, playerID, n)
     if err != nil {
         return nil, err
     }
@@ -166,6 +140,34 @@ func (r *PostgresRepository) GetPlayersAround(playerID string, n int) ([]models.
     }
 
     return entries, nil
+}
+
+func (r *PostgresRepository) GetPlayerRank(playerID string) (int, int64, error) {
+    query := `
+        WITH ranked AS MATERIALIZED (
+            SELECT 
+                player_id,
+                score,
+                ROW_NUMBER() OVER (ORDER BY score DESC, last_update ASC) as rank
+            FROM player_scores
+            WHERE season_id = (SELECT current_season_id())
+        )
+        SELECT rank, score
+        FROM ranked
+        WHERE player_id = $1
+    `
+
+    var rank int
+    var score int64
+    err := r.db.QueryRow(query, playerID).Scan(&rank, &score)
+    if err == sql.ErrNoRows {
+        return 0, 0, nil
+    }
+    if err != nil {
+        return 0, 0, err
+    }
+
+    return rank, score, nil
 }
 
 func (r *PostgresRepository) GetTotalPlayers() (int, error) {

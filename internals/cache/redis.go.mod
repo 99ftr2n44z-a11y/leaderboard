@@ -5,6 +5,7 @@ import (
     "encoding/json"
     "fmt"
     "leaderboard/internal/models"
+    "log"
     "time"
 
     "github.com/redis/go-redis/v9"
@@ -20,6 +21,7 @@ func NewRedisCache(addr, password string, db int) (*RedisCache, error) {
         Addr:     addr,
         Password: password,
         DB:       db,
+        PoolSize: 20, // Увеличиваем пул соединений
     })
 
     ctx := context.Background()
@@ -62,6 +64,24 @@ func (r *RedisCache) GetTopPlayers() ([]models.LeaderboardEntry, error) {
     }
 
     return entries, nil
+}
+
+// Проверка существования кэша
+func (r *RedisCache) TopPlayersExists() bool {
+    exists, err := r.client.Exists(r.ctx, "top_players").Result()
+    if err != nil {
+        return false
+    }
+    return exists > 0
+}
+
+// TTL кэша
+func (r *RedisCache) GetTopPlayersTTL() (time.Duration, error) {
+    ttl, err := r.client.TTL(r.ctx, "top_players").Result()
+    if err != nil {
+        return 0, err
+    }
+    return ttl, nil
 }
 
 // Кэширование ранка игрока
@@ -115,9 +135,13 @@ func (r *RedisCache) GetPlayersAround(playerID string) ([]models.LeaderboardEntr
     return entries, nil
 }
 
-// Инвалидация кэша
+// Инвалидация кэша с логированием ошибок
 func (r *RedisCache) InvalidateTop() error {
-    return r.client.Del(r.ctx, "top_players").Err()
+    err := r.client.Del(r.ctx, "top_players").Err()
+    if err != nil {
+        log.Printf("Failed to invalidate top cache: %v", err)
+    }
+    return err
 }
 
 func (r *RedisCache) InvalidatePlayer(playerID string) error {
@@ -125,9 +149,17 @@ func (r *RedisCache) InvalidatePlayer(playerID string) error {
         fmt.Sprintf("rank:%s", playerID),
         fmt.Sprintf("around:%s", playerID),
     }
-    return r.client.Del(r.ctx, keys...).Err()
+    err := r.client.Del(r.ctx, keys...).Err()
+    if err != nil {
+        log.Printf("Failed to invalidate player cache %s: %v", playerID, err)
+    }
+    return err
 }
 
 func (r *RedisCache) InvalidateAll() error {
-    return r.client.FlushDB(r.ctx).Err()
+    err := r.client.FlushDB(r.ctx).Err()
+    if err != nil {
+        log.Printf("Failed to flush cache: %v", err)
+    }
+    return err
 }

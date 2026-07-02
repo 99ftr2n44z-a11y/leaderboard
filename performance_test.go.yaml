@@ -1,0 +1,79 @@
+package main
+
+import (
+    "bytes"
+    "encoding/json"
+    "fmt"
+    "net/http"
+    "sync"
+    "testing"
+    "time"
+
+    "leaderboard/internal/models"
+)
+
+func TestPerformance(t *testing.T) {
+    baseURL := "http://localhost:8080/api/v1"
+    
+    // Тест записи
+    t.Run("Write Performance", func(t *testing.T) {
+        var wg sync.WaitGroup
+        start := time.Now()
+        
+        for i := 0; i < 1000; i++ {
+            wg.Add(1)
+            go func(id int) {
+                defer wg.Done()
+                req := models.ScoreUpdateRequest{
+                    PlayerID: fmt.Sprintf("player_%d", id%100),
+                    ScoreDelta: 10,
+                }
+                data, _ := json.Marshal(req)
+                http.Post(baseURL+"/score", "application/json", bytes.NewBuffer(data))
+            }(i)
+        }
+        
+        wg.Wait()
+        duration := time.Since(start)
+        t.Logf("1000 updates took: %v", duration)
+        t.Logf("Updates per second: %.2f", 1000/duration.Seconds())
+    })
+    
+    // Тест чтения топа
+    t.Run("Read Top Performance", func(t *testing.T) {
+        var wg sync.WaitGroup
+        start := time.Now()
+        
+        for i := 0; i < 1000; i++ {
+            wg.Add(1)
+            go func() {
+                defer wg.Done()
+                http.Get(baseURL + "/leaderboard/top?limit=100")
+            }()
+        }
+        
+        wg.Wait()
+        duration := time.Since(start)
+        t.Logf("1000 top reads took: %v", duration)
+        t.Logf("Reads per second: %.2f", 1000/duration.Seconds())
+    })
+    
+    // Тест чтения ранка
+    t.Run("Read Rank Performance", func(t *testing.T) {
+        var wg sync.WaitGroup
+        start := time.Now()
+        
+        for i := 0; i < 1000; i++ {
+            wg.Add(1)
+            go func(id int) {
+                defer wg.Done()
+                http.Get(fmt.Sprintf("%s/leaderboard/rank/player_%d", baseURL, id%100))
+            }(i)
+        }
+        
+        wg.Wait()
+        duration := time.Since(start)
+        t.Logf("1000 rank reads took: %v", duration)
+        t.Logf("Reads per second: %.2f", 1000/duration.Seconds())
+    })
+}
